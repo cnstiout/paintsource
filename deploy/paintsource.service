@@ -1,11 +1,11 @@
 [Unit]
-Description=PaintSource v1 (FastAPI)
+Description=PaintSource PRO (FastAPI)
 After=network.target
 
 [Service]
-User=paintsource
-WorkingDirectory=/opt/paintsource_v1
-ExecStart=/opt/paintsource_v1/.venv/bin/python app.py --host 127.0.0.1 --port 8765 --cols 160 --rows 48 --scale 6
+User=root
+WorkingDirectory=/opt/paintsource_pro
+ExecStart=/opt/paintsource_pro/.venv/bin/python app.py --host 127.0.0.1 --port 7100 --cols 80 --rows 24 --scale 10 --data /opt/paintsource_pro/data --autosave-sec 3
 Restart=always
 RestartSec=2
 Environment=PYTHONUNBUFFERED=1
