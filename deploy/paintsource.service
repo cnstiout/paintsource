@@ -1,0 +1,14 @@
+[Unit]
+Description=PaintSource v1 (FastAPI)
+After=network.target
+
+[Service]
+User=paintsource
+WorkingDirectory=/opt/paintsource_v1
+ExecStart=/opt/paintsource_v1/.venv/bin/python app.py --host 127.0.0.1 --port 8765 --cols 160 --rows 48 --scale 6
+Restart=always
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
