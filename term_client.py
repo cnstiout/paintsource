@@ -1,98 +1,149 @@
-# term_client.py — PRO TTY (BrushChar-compatible with server features)
-import asyncio, curses, json, websockets, uuid, time, argparse, string
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# term_client.py — client curses pour PaintSource (HTTP + SSE, sans websockets)
 
-def parse_args():
-    ap = argparse.ArgumentParser(description="PaintSource TTY client")
-    ap.add_argument("--ws", default="ws://127.0.0.1:7100/ws", help="WebSocket URL")
-    ap.add_argument("--cols", type=int, default=None, help="Force grid width (else learn from server)")
-    ap.add_argument("--rows", type=int, default=None, help="Force grid height (else learn from server)")
-    return ap.parse_args()
+import curses
+import threading
+import time
+import json
+import requests
+import argparse
 
-def draw_cell(stdscr, x, y, ch):
-    if ch is None: ch = " "
-    try: stdscr.addstr(y, x, ch)
-    except curses.error: pass
+# ───────────── Config CLI ─────────────
+parser = argparse.ArgumentParser()
+parser.add_argument("--api", default="http://127.0.0.1:5000",
+                    help="Base URL du serveur PaintSource (ex: http://192.168.1.29:5000)")
+parser.add_argument("--w", type=int, default=80)
+parser.add_argument("--h", type=int, default=24)
+args = parser.parse_args()
 
-def draw_status(stdscr, grid_w, grid_h, brush):
-    rows, cols = stdscr.getmaxyx()
-    msg = f"Target: {grid_w}x{grid_h} • Brush: {repr(brush) if brush else 'toggle(█/ )'} • q=quit"
-    try: stdscr.addstr(0, 0, msg[:max(0, cols-1)])
-    except curses.error: pass
+API = args.api.rstrip("/")
+CANVAS_W, CANVAS_H = args.w, args.h
+URL_GET   = f"{API}/canvas"
+URL_POST  = f"{API}/canvas"
+URL_SSE   = f"{API}/canvas/stream"
+URL_RESET = f"{API}/canvas/reset"
 
-async def recv_loop(stdscr, ws, grid):
+# ───────────── État partagé ─────────────
+canvas = [[" "] * CANVAS_W for _ in range(CANVAS_H)]
+lock = threading.Lock()
+
+# ───────────── Réseau ─────────────
+def fetch_initial():
+    try:
+        r = requests.get(URL_GET, timeout=5)
+        r.raise_for_status()
+        grid = r.json()
+        with lock:
+            H = min(len(grid), CANVAS_H)
+            W = min(len(grid[0]) if grid else 0, CANVAS_W)
+            for y in range(H):
+                for x in range(W):
+                    canvas[y][x] = grid[y][x]
+    except Exception:
+        pass
+
+def sse_listener():
+    """Écoute le flux SSE et met à jour le canvas en temps réel."""
     while True:
-        m = json.loads(await ws.recv())
-        t = m.get("type")
-        if t == "state":
-            if grid["w"] is None or grid["h"] is None:
-                grid["w"] = int(m.get("w", 80))
-                grid["h"] = int(m.get("h", 24))
-            stdscr.clear()
-            for p in m.get("pixels", []):
-                draw_cell(stdscr, p["x"], p["y"], p.get("char", "█"))
-            draw_status(stdscr, grid["w"], grid["h"], grid.get("brush"))
-            stdscr.refresh()
-        elif t == "system" and m.get("event") == "clear":
-            stdscr.clear(); draw_status(stdscr, grid["w"], grid["h"], grid.get("brush")); stdscr.refresh()
-        elif t == "op":
-            pts = m.get("op", {}).get("points", [])
-            chars = m.get("op", {}).get("chars", [])
-            if chars and len(chars)==len(pts):
-                for (x,y), ch in zip(pts, chars):
-                    draw_cell(stdscr, x, y, ch if ch is not None else " ")
-                draw_status(stdscr, grid["w"], grid["h"], grid.get("brush"))
-                stdscr.refresh()
+        try:
+            with requests.get(URL_SSE, stream=True, timeout=30) as r:
+                r.raise_for_status()
+                for raw in r.iter_lines():
+                    if not raw:
+                        continue
+                    if not raw.startswith(b"data:"):
+                        continue
+                    try:
+                        payload = json.loads(raw[5:].strip())
+                    except Exception:
+                        continue
+                    with lock:
+                        if "full" in payload:
+                            grid = payload["full"]
+                            H = min(len(grid), CANVAS_H)
+                            W = min(len(grid[0]) if grid else 0, CANVAS_W)
+                            for y in range(H):
+                                for x in range(W):
+                                    canvas[y][x] = grid[y][x]
+                        elif payload.get("reset"):
+                            for y in range(CANVAS_H):
+                                for x in range(CANVAS_W):
+                                    canvas[y][x] = " "
+                        else:
+                            x = payload.get("x"); y = payload.get("y"); ch = payload.get("ch")
+                            if (isinstance(x,int) and isinstance(y,int) and
+                                0 <= x < CANVAS_W and 0 <= y < CANVAS_H and
+                                isinstance(ch,str) and len(ch)==1):
+                                canvas[y][x] = ch
+        except Exception:
+            time.sleep(1)  # backoff léger et on retente
 
-async def send_draw(ws, x, y, brush):
-    op = {"tool":"put","points":[[x,y]]}
-    if brush and len(brush)==1:
-        op["char"] = brush
-    msg = {"v":1,"type":"op","room":"paintsource/global","user":{"id":str(uuid.uuid4()),"nick":"tty"},
-           "ts":int(time.time()*1000),"op":op}
-    await ws.send(json.dumps(msg))
+def send_update(x, y, ch):
+    try:
+        requests.post(URL_POST, json={"x": x, "y": y, "ch": ch}, timeout=2)
+    except Exception:
+        pass
 
-async def main(stdscr, args):
-    curses.curs_set(0); stdscr.nodelay(True); stdscr.keypad(True)
-    curses.mouseinterval(0)
-    try: curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
-    except Exception: pass
+# ───────────── UI (curses) ─────────────
+def main(stdscr):
+    curses.curs_set(1)
+    stdscr.nodelay(True)
+    x = y = 0
 
-    grid = {"w": args.cols, "h": args.rows, "brush": None}
-    draw_status(stdscr, grid.get("w") or 80, grid.get("h") or 24, grid["brush"])
-    stdscr.refresh()
+    def render_cell(c):
+        return c if c != " " else "·"
 
-    async with websockets.connect(args.ws) as ws:
-        asyncio.create_task(recv_loop(stdscr, ws, grid))
-        drawing=False
-        while True:
-            k = stdscr.getch()
-            if k == -1:
-                await asyncio.sleep(0.01); continue
-            if k in (ord('q'), 27):
-                break
+    while True:
+        stdscr.clear()
+        max_y, max_x = stdscr.getmaxyx()
+        # on garde de la place pour bordures + 2 lignes d'infos
+        w = max(1, min(CANVAS_W, max_x - 2))
+        h = max(1, min(CANVAS_H, max_y - 3))
 
-            if 32 <= k <= 126:
-                ch = chr(k)
-                if ch in string.printable and len(ch) == 1:
-                    grid["brush"] = ch
-                    draw_status(stdscr, grid.get("w") or 80, grid.get("h") or 24, grid["brush"])
-                    stdscr.refresh()
-                    continue
+        # cadre haut
+        try: stdscr.addstr(0, 0, "+" + "-"*w + "+")
+        except curses.error: pass
 
-            if k == curses.KEY_MOUSE and grid["w"] and grid["h"]:
-                try: _id, mx, my, _z, bstate = curses.getmouse()
-                except curses.error: continue
-                if not (0 <= mx < grid["w"] and 0 <= my < grid["h"]): continue
-                if bstate & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED):
-                    drawing=True; await send_draw(ws, mx, my, grid["brush"])
-                elif drawing and (bstate & getattr(curses, "REPORT_MOUSE_POSITION", 0) or bstate & getattr(curses, "BUTTON1_PRESSED", 0)):
-                    await send_draw(ws, mx, my, grid["brush"])
-                if bstate & getattr(curses, "BUTTON1_RELEASED", 0):
-                    drawing=False
-                    grid["brush"] = None
-                    draw_status(stdscr, grid.get("w") or 80, grid.get("h") or 24, grid["brush"])
-                    stdscr.refresh()
+        # contenu
+        with lock:
+            for ry in range(h):
+                row = "".join(render_cell(canvas[ry][cx]) for cx in range(w))
+                try: stdscr.addstr(1+ry, 0, "|" + row + "|")
+                except curses.error: pass
+
+        # cadre bas + infos
+        try: stdscr.addstr(1+h, 0, "+" + "-"*w + "+")
+        except curses.error: pass
+        info = f"API: {API}  ←↑↓→: bouger  taper: dessiner  Entrée: (0,0)  ESC: quitter"
+        try: stdscr.addstr(2+h, 0, info[:max_x])
+        except curses.error: pass
+
+        # clamp du curseur
+        y = max(0, min(y, h-1))
+        x = max(0, min(x, w-1))
+        stdscr.move(1+y, 1+x)
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if   key == curses.KEY_UP:    y -= 1
+        elif key == curses.KEY_DOWN:  y += 1
+        elif key == curses.KEY_LEFT:  x -= 1
+        elif key == curses.KEY_RIGHT: x += 1
+        elif key in (10,13):          x, y = 0, 0
+        elif key == 27:               break
+        elif key == -1:
+            time.sleep(0.01); continue
+        else:
+            try:
+                ch = chr(key)
+            except ValueError:
+                continue
+            with lock:
+                canvas[y][x] = ch
+            send_update(x, y, ch)
 
 if __name__ == "__main__":
-    args = parse_args()
-    curses.wrapper(lambda scr: asyncio.run(main(scr, args)))
+    fetch_initial()
+    threading.Thread(target=sse_listener, daemon=True).start()
+    curses.wrapper(main)

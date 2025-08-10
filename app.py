@@ -1,342 +1,271 @@
-# app.py — PaintSource PRO (stroke-lock web + letters + persistence + safe HTML)
-import asyncio, json, argparse, time, pathlib
-from typing import Dict, Tuple, Optional
-from fastapi import FastAPI, WebSocket
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.websockets import WebSocketDisconnect
-import uvicorn
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+PaintSource — app.py (stdlib only)
+- Serveur HTTP + SSE (sans Flask)
+- Persistance (canvas_state.json) + logs (canvas_updates.log)
+- Reset automatique quotidien
+- Affiche les URLs locales pour accès depuis le téléphone (même Wi-Fi)
+"""
 
-def make_app(cols: int, rows: int, scale: int, data_dir: str, autosave_sec: int):
-    app = FastAPI()
-    GRID_W = int(cols)
-    GRID_H = int(rows)
-    SCALE  = max(1, int(scale))
-    AUTOSAVE_SEC = max(1, int(autosave_sec))
+import http.server
+import socketserver
+import socket
+import threading
+import time
+import json
+import os
+import sys
+from datetime import datetime
+from string import Template
 
-    framebuffer: Dict[Tuple[int,int], Optional[str]] = {}
-    clients = set()
+# ───────────────────────────────── Config ─────────────────────────────────
 
-    DATA_DIR = pathlib.Path(data_dir).expanduser().resolve()
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_PATH = DATA_DIR / "state.json"
-    dirty_flag = {"dirty": False}
-    autosave_task = {"task": None}
+PORT = int(os.getenv('PAINTSOURCE_PORT', '5000'))
+CANVAS_W, CANVAS_H = 80, 24
+RESET_INTERVAL = 24 * 3600  # secondes
+DATA_FILE = 'canvas_state.json'
+LOG_FILE  = 'canvas_updates.log'
 
-    def save_state():
-        data = {"w": GRID_W, "h": GRID_H,
-                "pixels": [{"x":x,"y":y,"char":ch} for (x,y), ch in framebuffer.items() if ch],
-                "saved_at": int(time.time())}
-        tmp = STATE_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False))
-        tmp.replace(STATE_PATH)
+# ──────────────────────────────── État & I/O ─────────────────────────────
 
-    def load_state():
-        if not STATE_PATH.exists(): return
+def load_canvas():
+    if os.path.exists(DATA_FILE):
         try:
-            data = json.loads(STATE_PATH.read_text())
+            with open(DATA_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
         except Exception:
-            return
-        for p in data.get("pixels", []):
-            try:
-                x, y = int(p["x"]), int(p["y"]); ch = p.get("char")
-            except Exception:
-                continue
-            if 0 <= x < GRID_W and 0 <= y < GRID_H and ch:
-                framebuffer[(x,y)] = ch
-
-    async def autosave_loop():
-        while True:
-            await asyncio.sleep(AUTOSAVE_SEC)
-            if dirty_flag["dirty"]:
-                try: save_state()
-                except Exception: pass
-                dirty_flag["dirty"] = False
-
-    HTML_TEMPLATE = """<!DOCTYPE html>
-<html>
-<head>
-  <meta charset='utf-8'>
-  <title>PaintSource — __GRID_W__×__GRID_H__</title>
-  <style>
-    html,body{margin:0;height:100%;background:#111;color:#eee;font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace}
-    #wrap{padding:16px}
-    #c{border:1px solid #444;background:#000;image-rendering:pixelated;cursor:crosshair;display:block}
-    .status{opacity:.8;margin:8px 16px}
-  </style>
-</head>
-<body>
-<div id="wrap">
-  <h3 style="padding:16px 16px 0 16px;margin:0">PaintSource — __GRID_W__×__GRID_H__</h3>
-  <canvas id="c" width="__CANVAS_W__" height="__CANVAS_H__"></canvas>
-  <div class="status" id="status">WS: connecting… • Mode: idle</div>
-</div>
-<script>
-const W = __GRID_W__, H = __GRID_H__, SCALE = __SCALE__;
-const c = document.getElementById('c');
-const ctx = c.getContext('2d', { alpha: false });
-ctx.imageSmoothingEnabled = false;
-ctx.textBaseline = 'top';
-ctx.font = (SCALE) + 'px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
-
-const filled = new Set();
-function key(x,y){ return x+','+y; }
-function setLocal(x,y,ch){
-  const k = key(x,y);
-  if(!ch){ filled.delete(k); } else { filled.add(k); }
-}
-
-function drawCell(x,y,ch){
-  ctx.fillStyle = '#000';
-  ctx.fillRect(x*SCALE, y*SCALE, SCALE, SCALE);
-  if(!ch) return;
-  if(ch === '█'){
-    ctx.fillStyle = '#fff';
-    ctx.fillRect(x*SCALE, y*SCALE, SCALE, SCALE);
-  } else {
-    ctx.fillStyle = '#fff';
-    ctx.fillText(ch, x*SCALE, y*SCALE);
-  }
-  setLocal(x,y,ch);
-}
-
-const ws = new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');
-const statusEl = document.getElementById('status');
-function setStatus(conn, mode){ statusEl.textContent = 'WS: ' + conn + ' • Mode: ' + mode; }
-ws.onopen = ()=> setStatus('connected', 'idle');
-ws.onclose = ()=> setStatus('disconnected', 'idle');
-ws.onerror = ()=> setStatus('error', 'idle');
-ws.onmessage = ev => {
-  const m = JSON.parse(ev.data);
-  if(m.type==='state'){
-    ctx.fillStyle='#000'; ctx.fillRect(0,0,W*SCALE,H*SCALE);
-    filled.clear();
-    for(const p of m.pixels||[]) drawCell(p.x, p.y, p.char);
-  } else if(m.type==='system' && m.event==='clear'){
-    ctx.fillStyle='#000'; ctx.fillRect(0,0,W*SCALE,H*SCALE);
-    filled.clear();
-  } else if(m.type==='op' && m.op){
-    const pts = m.op.points||[];
-    const chars = m.op.chars||[];
-    for(let i=0;i<pts.length;i++){
-      const [x,y] = pts[i];
-      const ch = chars.length ? chars[i] : null;
-      drawCell(x,y,ch);
-    }
-  }
-};
-
-let drawing=false;
-let strokeChar = null;
-let currentBrush = null;
-let lastX=null, lastY=null;
-
-window.addEventListener('keydown', (e)=>{
-  if(e.key && e.key.length === 1){
-    currentBrush = e.key;
-    if(!drawing) setStatus('connected', 'char ' + JSON.stringify(currentBrush));
-  }
-});
-window.addEventListener('keyup', (e)=>{
-  if(e.key && e.key.length === 1 && currentBrush === e.key){
-    currentBrush = null;
-    if(!drawing) setStatus('connected', 'idle');
-  }
-});
-
-function clamp(n, min, max){ return Math.max(min, Math.min(max, n)); }
-function canvasToCell(e){
-  const r=c.getBoundingClientRect();
-  const lx = Math.floor((e.clientX - r.left)  * (c.width  / r.width));
-  const ly = Math.floor((e.clientY - r.top)   * (c.height / r.height));
-  const x = clamp(Math.floor(lx / SCALE), 0, W-1);
-  const y = clamp(Math.floor(ly / SCALE), 0, H-1);
-  return [x,y];
-}
-
-function bresenham(x0,y0,x1,y1){
-  const pts=[];
-  let dx=Math.abs(x1-x0), dy=-Math.abs(y1-y0);
-  let sx=x0<x1?1:-1, sy=y0<y1?1:-1, err=dx+dy;
-  while(true){
-    pts.push([x0,y0]);
-    if(x0===x1 && y0===y1) break;
-    let e2=2*err;
-    if(e2>=dy){ err+=dy; x0+=sx; }
-    if(e2<=dx){ err+=dx; y0+=sy; }
-  }
-  return pts;
-}
-
-function sendSet(points, ch){
-  if(ws.readyState!==1 || points.length===0) return;
-  ws.send(JSON.stringify({
-    v:1, type:'op', room:'paintsource/global',
-    user:{nick:'web'}, ts:Date.now(),
-    op:{tool:'set', mode:'set', points:points, char: ch ?? null}
-  }));
-}
-
-c.addEventListener('contextmenu', e=>e.preventDefault());
-c.addEventListener('mousedown', e=>{
-  drawing=true;
-  const [x,y]=canvasToCell(e);
-  let targetChar = null;
-  if(currentBrush && currentBrush.length===1){
-    targetChar = currentBrush;
-    setStatus('connected', 'char ' + JSON.stringify(targetChar));
-  }else{
-    const wasFilled = filled.has(key(x,y));
-    targetChar = wasFilled ? null : '█';
-    setStatus('connected', targetChar ? 'WHITE' : 'ERASE');
-  }
-  strokeChar = targetChar;
-  lastX=x; lastY=y;
-  drawCell(x,y,targetChar);
-  sendSet([[x,y]], targetChar);
-});
-c.addEventListener('mousemove', e=>{
-  if(!drawing) return;
-  const [x,y]=canvasToCell(e);
-  if(x===lastX && y===lastY) return;
-  const pts = bresenham(lastX,lastY,x,y);
-  lastX=x; lastY=y;
-  for(const [px,py] of pts){ drawCell(px,py,strokeChar); }
-  sendSet(pts, strokeChar);
-});
-function stopStroke(){
-  drawing=false; strokeChar=null; lastX=lastY=null;
-  setStatus('connected', currentBrush ? 'char ' + JSON.stringify(currentBrush) : 'idle');
-}
-c.addEventListener('mouseup',   stopStroke);
-c.addEventListener('mouseleave',stopStroke);
-</script>
-</body>
-</html>"""
-
-    HTML = (HTML_TEMPLATE
-            .replace("__GRID_W__", str(cols))
-            .replace("__GRID_H__", str(rows))
-            .replace("__SCALE__", str(scale))
-            .replace("__CANVAS_W__", str(cols * scale))
-            .replace("__CANVAS_H__", str(rows * scale))
-           )
-
-    def set_cell(x:int, y:int, ch: Optional[str]):
-        framebuffer[(x,y)] = ch
-        dirty_flag["dirty"] = True
-
-    def toggle_cell(x:int, y:int):
-        cur = framebuffer.get((x,y))
-        framebuffer[(x,y)] = None if cur == '█' else '█'
-        dirty_flag["dirty"] = True
-
-    def serialize_state():
-        pixels = [{"x":x,"y":y,"char":ch} for (x,y), ch in framebuffer.items() if ch]
-        return {"type":"state", "w": GRID_W, "h": GRID_H, "pixels": pixels}
-
-    @app.get("/", response_class=HTMLResponse)
-    async def index():
-        return HTML
-
-    @app.get("/state")
-    async def state():
-        return JSONResponse(serialize_state())
-
-    @app.post("/clear")
-    async def clear():
-        framebuffer.clear()
-        dirty_flag["dirty"] = True
-        msg = {"type":"system","event":"clear"}
-        dead = []
-        for ws in list(clients):
-            try: await ws.send_text(json.dumps(msg))
-            except Exception: dead.append(ws)
-        for ws in dead:
-            clients.discard(ws)
-        return {"ok": True}
-
-    @app.post("/save")
-    async def manual_save():
-        save_state()
-        dirty_flag["dirty"] = False
-        return {"ok": True}
-
-    @app.websocket("/ws")
-    async def ws_endpoint(ws: WebSocket):
-        await ws.accept()
-        await ws.send_text(json.dumps(serialize_state()))
-        clients.add(ws)
-        try:
-            while True:
-                raw = await ws.receive_text()
-                msg = json.loads(raw)
-                op = msg.get("op", {})
-                tool = op.get("tool")
-                pts = op.get("points", [])
-                char = op.get("char", None)
-                mode = op.get("mode")
-
-                safe_pts, chars = [], []
-                for x,y in pts:
-                    try:
-                        x = int(x); y = int(y)
-                    except Exception:
-                        continue
-                    if not (0 <= x < GRID_W and 0 <= y < GRID_H):
-                        continue
-                    if tool == "set" and mode == "set":
-                        set_cell(x,y,char if char else None)
-                    elif tool in ("put","toggle"):
-                        if "char" in op and op["char"] is not None:
-                            set_cell(x,y,op["char"])
-                        else:
-                            toggle_cell(x,y)
-                    else:
-                        toggle_cell(x,y)
-                    safe_pts.append([x,y])
-                    chars.append(framebuffer.get((x,y)))
-
-                if not safe_pts:
-                    continue
-                enriched = {"type":"op", "op":{"tool": tool or "put","points":safe_pts,"chars":chars}}
-                dead = []
-                for peer in list(clients):
-                    try: await peer.send_text(json.dumps(enriched))
-                    except Exception: dead.append(peer)
-                for peer in dead:
-                    clients.discard(peer)
-        except WebSocketDisconnect:
             pass
-        finally:
-            clients.discard(ws)
+    return [[' ']*CANVAS_W for _ in range(CANVAS_H)]
 
-    @app.on_event("startup")
-    async def _startup():
-        load_state()
-        autosave_task["task"] = asyncio.create_task(autosave_loop())
+canvas = load_canvas()
+lock = threading.Lock()
+subscribers = []  # Handlers SSE actifs
+last_reset = time.time()
 
-    @app.on_event("shutdown")
-    async def _shutdown():
-        try: save_state()
-        except Exception: pass
-        t = autosave_task.get("task")
-        if t: t.cancel()
+def save_canvas():
+    with lock:
+        with open(DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(canvas, f)
 
-    return app
+def log_update(x, y, ch):
+    with open(LOG_FILE, 'a', encoding='utf-8') as f:
+        f.write(f"{datetime.now().isoformat()} UPDATE x={x} y={y} ch={ch}\n")
 
-def main():
-    ap = argparse.ArgumentParser(description="PaintSource PRO")
-    ap.add_argument("--cols", "-c", type=int, default=80, help="Canvas columns (width)")
-    ap.add_argument("--rows", "-r", type=int, default=24, help="Canvas rows (height)")
-    ap.add_argument("--scale", "-s", type=int, default=10, help="Web UI scale (px per cell)")
-    ap.add_argument("--host", default="127.0.0.1", help="Bind host")
-    ap.add_argument("--port", "-p", type=int, default=7100, help="Bind port")
-    ap.add_argument("--data", default="./data", help="Directory for saved JSON state")
-    ap.add_argument("--autosave-sec", type=int, default=3, help="Autosave interval (seconds)")
-    args = ap.parse_args()
+def log_reset():
+    with open(LOG_FILE, 'a', encoding='utf-8') as f:
+        f.write(f"{datetime.now().isoformat()} RESET all\n")
 
-    app = make_app(args.cols, args.rows, args.scale, args.data, args.autosave_sec)
-    uvicorn.run(app, host=args.host, port=args.port)
+# ───────────────────────────── Helpers réseau ─────────────────────────────
 
-if __name__ == "__main__":
-    main()
+def local_ipv4s():
+    ips = set()
+    # 1) socket UDP sortante (détecte l’IP active)
+    for target in (('8.8.8.8', 80), ('1.1.1.1', 80)):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(target)
+            ips.add(s.getsockname()[0])
+            s.close()
+        except Exception:
+            pass
+    # 2) getaddrinfo(hostname)
+    try:
+        hn = socket.gethostname()
+        for fam, *_ in socket.getaddrinfo(hn, None):
+            if fam == socket.AF_INET:
+                # Certaines implémentations ne renvoient pas l’IP directement ici
+                pass
+    except Exception:
+        pass
+    # Filtrer loopback et garder privées si présentes
+    def is_private(ip):
+        try:
+            a, b, c, d = map(int, ip.split('.'))
+            if a == 10: return True
+            if a == 192 and b == 168: return True
+            if a == 172 and 16 <= b <= 31: return True
+            return False
+        except Exception:
+            return False
+    privs = [ip for ip in ips if is_private(ip)]
+    return privs or [ip for ip in ips if not ip.startswith('127.')] or ['127.0.0.1']
+
+# ──────────────────────────────── SSE helpers ─────────────────────────────
+
+def notify_all(message: dict):
+    dead = []
+    for h in list(subscribers):
+        try:
+            h.send_sse(message)
+        except Exception:
+            dead.append(h)
+    for h in dead:
+        try:
+            subscribers.remove(h)
+        except ValueError:
+            pass
+
+# ─────────────────────────────── Reset quotidien ─────────────────────────
+
+def periodic_reset():
+    global last_reset
+    while True:
+        time.sleep(1)
+        if time.time() - last_reset >= RESET_INTERVAL:
+            with lock:
+                for y in range(CANVAS_H):
+                    for x in range(CANVAS_W):
+                        canvas[y][x] = ' '
+            last_reset = time.time()
+            log_reset()
+            save_canvas()
+            notify_all({'reset': True})
+
+# ──────────────────────────────── Page HTML (Template) ───────────────────
+
+HTML = Template("""<!doctype html>
+<html lang="fr"><head><meta charset="utf-8"><title>PaintSource</title>
+<style>
+  body{background:#111;color:#ddd;font-family:monospace;margin:16px}
+  #canvas{white-space:pre;line-height:1;font-size:12px}
+</style>
+</head><body>
+<h3>PaintSource</h3>
+<pre id="canvas">$initial</pre>
+<script>
+let grid;
+const sse = new EventSource('/canvas/stream');
+sse.onmessage = e => {
+  const m = JSON.parse(e.data);
+  if (m.full) { grid = m.full; }
+  else if (m.reset) { grid = Array($h).fill().map(_=>Array($w).fill(' ')); }
+  else { grid[m.y][m.x] = m.ch; }
+  render();
+};
+fetch('/canvas').then(r=>r.json()).then(g=>{ grid = g; render(); });
+
+function render(){
+  document.getElementById('canvas').textContent =
+    grid.map(r=>r.map(c=>c===' ' ? '·' : c).join('')).join('\\n');
+}
+</script>
+</body></html>""")
+
+# ─────────────────────────────── HTTP Handler ─────────────────────────────
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def send_json(self, data):
+        body = json.dumps(data).encode()
+        self.send_response(200)
+        self.send_header('Content-Type','application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_sse(self, data):
+        self.wfile.write(f"data: {json.dumps(data)}\n\n".encode())
+        self.wfile.flush()
+
+    def do_GET(self):
+        if self.path == '/':
+            with lock:
+                initial = '\n'.join(''.join(c if c!=' ' else '·' for c in row) for row in canvas)
+            b = HTML.substitute(initial=initial, w=CANVAS_W, h=CANVAS_H).encode()
+            self.send_response(200)
+            self.send_header('Content-Type','text/html')
+            self.send_header('Content-Length', str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+        elif self.path == '/canvas':
+            with lock:
+                self.send_json(canvas)
+        elif self.path == '/canvas/stream':
+            self.send_response(200)
+            self.send_header('Content-Type','text/event-stream')
+            self.send_header('Cache-Control','no-cache')
+            self.end_headers()
+            subscribers.append(self)
+            try:
+                # état initial
+                with lock:
+                    self.send_sse({'full': canvas})
+                # keepalive ping toutes 15s
+                while True:
+                    time.sleep(15)
+                    try:
+                        self.wfile.write(b":\n\n")
+                        self.wfile.flush()
+                    except Exception:
+                        break
+            finally:
+                if self in subscribers:
+                    try:
+                        subscribers.remove(self)
+                    except ValueError:
+                        pass
+        else:
+            self.send_response(404); self.end_headers()
+
+    def do_POST(self):
+        if self.path not in ('/canvas','/canvas/reset'):
+            self.send_response(404); self.end_headers(); return
+
+        length = int(self.headers.get('Content-Length', 0))
+        raw = self.rfile.read(length) if length else b'{}'
+        try:
+            data = json.loads(raw) if raw else {}
+        except Exception:
+            self.send_response(400); self.end_headers(); return
+
+        if self.path == '/canvas':
+            x, y, ch = data.get('x'), data.get('y'), data.get('ch')
+            if (isinstance(x,int) and isinstance(y,int) and
+                0 <= x < CANVAS_W and 0 <= y < CANVAS_H and
+                isinstance(ch,str) and len(ch)==1):
+                with lock:
+                    canvas[y][x] = ch
+                log_update(x,y,ch)
+                save_canvas()
+                notify_all({'x':x,'y':y,'ch':ch})
+                self.send_json({'success': True})
+            else:
+                self.send_response(400); self.end_headers()
+        else:  # /canvas/reset
+            with lock:
+                for yy in range(CANVAS_H):
+                    for xx in range(CANVAS_W):
+                        canvas[yy][xx] = ' '
+            log_reset()
+            save_canvas()
+            notify_all({'reset': True})
+            self.send_json({'success': True})
+
+# ─────────────────────────────── Lancement ────────────────────────────────
+
+def print_local_urls(port: int):
+    ips = local_ipv4s()
+    print("\nPaintSource est prêt ✨  Ouvre depuis ton téléphone (même Wi-Fi) :")
+    for ip in ips:
+        print(f"  → http://{ip}:{port}/")
+    try:
+        print(f"  → http://{socket.gethostname()}.local:{port}/ (si mDNS)")
+    except Exception:
+        pass
+    print("")
+
+if __name__ == '__main__':
+    threading.Thread(target=periodic_reset, daemon=True).start()
+    try:
+        with socketserver.ThreadingTCPServer(('0.0.0.0', PORT), Handler) as srv:
+            print_local_urls(PORT)
+            print(f"Serving PaintSource on 0.0.0.0:{PORT} …  (Ctrl+C pour arrêter)")
+            srv.serve_forever()
+    except OSError as e:
+        if getattr(e, 'errno', None) == 98:
+            print(f"[ERREUR] Le port {PORT} est déjà utilisé. Éteins l'ancien serveur :")
+            print("  pkill -f app.py   # ou server.py")
+            print(f"  lsof -iTCP:{PORT} -sTCP:LISTEN")
+        else:
+            print("[ERREUR]", e)
+        sys.exit(1)
